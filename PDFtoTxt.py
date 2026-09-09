@@ -17,22 +17,6 @@ NUMERIC_FRAC = 0.60  # a candidate line that is >= 60% digits is treated as a pa
 NUMERIC_MAXLEN = 10  # ... but only if it is short (avoids catching data-heavy body lines)
 
 
-def select_pdf():
-    # Fallback GUI picker when no path is passed on the command line
-    import tkinter as tk
-    from tkinter import filedialog
-
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-
-    file_path = filedialog.askopenfilename(
-        title="Select PDF Book to Clean",
-        filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
-    )
-    return file_path
-
-
 # --- text helpers -------------------------------------------------------------
 
 
@@ -208,7 +192,7 @@ def _report(furniture, stats, n_pages):
 
 def _write(output_dir: Path, pdf_path: Path, text: str):
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"{pdf_path.stem}_cleaned.txt"
+    out_path = output_dir / f"{pdf_path.stem}.txt"
     out_path.write_text(text, encoding="utf-8")
     print(f"  Saved: {out_path}")
 
@@ -216,13 +200,7 @@ def _write(output_dir: Path, pdf_path: Path, text: str):
 # --- entry point -----------------------------------------------------------
 
 
-def run(target: str = None, simple: bool = False):
-    if not target:
-        target = select_pdf()
-    if not target:
-        print("No file selected. Operation canceled.")
-        return
-
+def run(target: str, simple: bool = False):
     path = Path(target).expanduser()
     if not path.exists():
         print(f"Path does not exist: {path}")
@@ -252,12 +230,22 @@ def run(target: str = None, simple: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Extract clean body text from PDF(s), dropping running headers/footers/page numbers."
+        prog="PDFtoTxt.py",
+        description="Extract clean body text from PDF(s), dropping running "
+        "headers, footers, and page numbers. Output goes to a 'clean/' "
+        "directory next to the input.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  python PDFtoTxt.py book.pdf            clean one file  -> ./clean/book.txt\n"
+            "  python PDFtoTxt.py ~/Books/            clean every PDF -> ~/Books/clean/\n"
+            "  python PDFtoTxt.py book.pdf --simple   use the fixed top/bottom 10% crop\n"
+        ),
     )
     parser.add_argument(
         "path",
         nargs="?",
-        help="a PDF file or a directory of PDFs (omit to open a file picker)",
+        help="a PDF file, or a directory whose *.pdf files should all be processed",
     )
     parser.add_argument(
         "--simple",
@@ -265,4 +253,9 @@ if __name__ == "__main__":
         help="use the old fixed 10%% top/bottom crop instead of detection",
     )
     args = parser.parse_args()
+
+    if not args.path:
+        parser.print_help()
+        raise SystemExit(0)
+
     run(args.path, simple=args.simple)
