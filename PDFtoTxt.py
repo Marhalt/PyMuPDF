@@ -1,7 +1,10 @@
 import argparse
 import math
+import os
 import re
 from collections import defaultdict
+from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 
 import pymupdf  # PyMuPDF (formerly imported as `fitz`)
@@ -15,6 +18,9 @@ RUN_MIN_PAGES = 4  # section-header run: min pages the text must appear on
 RUN_MIN_DENSITY = 0.55  # ... and it must fill >= 55% of the page span it covers
 NUMERIC_FRAC = 0.60  # a candidate line that is >= 60% digits is treated as a page number
 NUMERIC_MAXLEN = 10  # ... but only if it is short (avoids catching data-heavy body lines)
+OCR_MIN_CHARS = 50  # with --ocr, a page with images and less real text than this gets OCRed
+OCR_DPI = 300  # render resolution for OCR; Tesseract does best around 300
+OCR_LANGUAGE = "eng"
 
 
 # --- text helpers -------------------------------------------------------------
@@ -49,14 +55,66 @@ def zone_of(y0f: float, y1f: float):
 # --- detection ----------------------------------------------------------------
 
 
-def extract_lines(doc):
+def find_tessdata():
+    """Return Tesseract's language folder, or None if Tesseract isn't installed."""
+    try:
+        return pymupdf.get_tessdata()
+    except RuntimeError:
+        return None
+
+
+@contextmanager
+def tesseract_quiet():
+    """Hide Tesseract's chatter, e.g. 'Image too small to scale!!' for specks on a scan.
+
+    It writes straight to file descriptor 2, so redirecting sys.stderr wouldn't
+    catch it. Real OCR failures still surface as Python exceptions.
+    """
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
+
+
+def ocr_page(page, tessdata):
+    """Return a one-page PDF of OCR text for a page of pictures, or None if it has real text.
+
+    The whole page is OCRed because OCRing just the images would duplicate the
+    invisible text layer of a scan that was already OCRed once. We go through a
+    pixmap instead of page.get_textpage_ocr() because that returns unrotated
+    coordinates, which would put a rotated page's headers in the wrong zone.
+    """
+    if not page.get_images() or len(page.get_text("text").strip()) >= OCR_MIN_CHARS:
+        return None
+    pix = page.get_pixmap(dpi=OCR_DPI)
+    with tesseract_quiet():
+        pdf_bytes = pix.pdfocr_tobytes(language=OCR_LANGUAGE, tessdata=tessdata)
+    return pymupdf.open("pdf", pdf_bytes)
+
+
+def extract_lines(doc, tessdata=None):
     """Per page: a list of (text, y0_fraction, y1_fraction), in reading order.
 
     Coordinates are page-space; rotated pages are handled by PyMuPDF's rect/bbox
     already being in the rotated frame, so the fractions stay meaningful.
+
+    If tessdata is given, pages that are mostly pictures are read with OCR.
     """
     pages = []
+    ocr_count = 0
     for page in doc:
+        ocr_doc = None
+        if tessdata:
+            print(f"  OCR page {page.number + 1}/{len(doc)}", end="\r", flush=True)
+            ocr_doc = ocr_page(page, tessdata)
+        if ocr_doc:
+            ocr_count += 1
+            page = ocr_doc[0]
         height = page.rect.height or 1.0
         data = page.get_text("dict", sort=True)
         lines = []
@@ -70,6 +128,8 @@ def extract_lines(doc):
                 _, y0, _, y1 = ln["bbox"]
                 lines.append((text, y0 / height, y1 / height))
         pages.append(lines)
+    if tessdata:
+        print(f"  OCR read {ocr_count} of {len(doc)} pages; the rest had real text.")
     return pages
 
 
@@ -150,11 +210,11 @@ def clean_pdf_simple(pdf_path: Path, output_dir: Path):
     _write(output_dir, pdf_path, "\n\n".join(clean_pages))
 
 
-def clean_pdf_smart(pdf_path: Path, output_dir: Path):
+def clean_pdf_smart(pdf_path: Path, output_dir: Path, tessdata=None):
     """Detect running headers/footers/page numbers by repetition + position."""
     doc = pymupdf.open(pdf_path)
     print(f"Processing {len(doc)} pages...")
-    pages = extract_lines(doc)
+    pages = extract_lines(doc, tessdata)
     doc.close()
 
     if len(pages) < 5:
@@ -200,13 +260,28 @@ def _write(output_dir: Path, pdf_path: Path, text: str):
 # --- entry point -----------------------------------------------------------
 
 
-def run(target: str, simple: bool = False):
+def run(target: str, simple: bool = False, ocr: bool = False):
     path = Path(target).expanduser()
     if not path.exists():
         print(f"Path does not exist: {path}")
         return
 
-    clean = clean_pdf_simple if simple else clean_pdf_smart
+    if ocr:
+        if simple:
+            print("--ocr ignores --simple: using header/footer detection.")
+        tessdata = find_tessdata()
+        if not tessdata:
+            print(
+                "--ocr needs Tesseract, which was not found. "
+                "Install it, then run this again:\n"
+                "  macOS:    brew install tesseract\n"
+                "  Linux:    sudo apt install tesseract-ocr\n"
+                "  Windows:  https://github.com/UB-Mannheim/tesseract/wiki"
+            )
+            return
+        clean = partial(clean_pdf_smart, tessdata=tessdata)
+    else:
+        clean = clean_pdf_simple if simple else clean_pdf_smart
 
     if path.is_file():
         if path.suffix.lower() != ".pdf":
@@ -240,6 +315,7 @@ if __name__ == "__main__":
             "  python PDFtoTxt.py book.pdf            clean one file  -> ./clean/book.txt\n"
             "  python PDFtoTxt.py ~/Books/            clean every PDF -> ~/Books/clean/\n"
             "  python PDFtoTxt.py book.pdf --simple   use the fixed top/bottom 10% crop\n"
+            "  python PDFtoTxt.py scan.pdf --ocr      read pages of pictures with Tesseract\n"
         ),
     )
     parser.add_argument(
@@ -252,10 +328,16 @@ if __name__ == "__main__":
         action="store_true",
         help="use the old fixed 10%% top/bottom crop instead of detection",
     )
+    parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="OCR pages that have images but little real text (needs Tesseract; "
+        "ignores --simple)",
+    )
     args = parser.parse_args()
 
     if not args.path:
         parser.print_help()
         raise SystemExit(0)
 
-    run(args.path, simple=args.simple)
+    run(args.path, simple=args.simple, ocr=args.ocr)
